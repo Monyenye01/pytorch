@@ -3227,7 +3227,7 @@ class ComputedBuffer(Buffer):
     ):
         """
         This is a main place where we do loop transformations in a
-        backend-agnostic way.
+        backend-agnostic way.1
 
         Here we:
             1) Remove any 1 dimensions

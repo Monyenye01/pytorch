@@ -1316,11 +1316,29 @@ class Scheduler:
         adj_list_dag = self.create_adj_list_rep_dag_from_scheduler_nodes()
         print(adj_list_dag)
         
+        # split nodes
+        adj_list_split_nodes = self.create_transform_adj_list_split_nodes(adj_list_dag)
+        print(adj_list_split_nodes)
+        
         # transform ad_list rep DAG to SimpleDataFlowModel
-        adj_list_transformed_dag = self.create_simple_data_flow_model_graph(adj_list_dag)
+        adj_list_transformed_dag = self.create_simple_data_flow_model_graph(adj_list_split_nodes)
         print(adj_list_transformed_dag)
 
-        #TODO: Check if transformation affects series-parallel properties of graphs?
+        # get transformed graph g_plus
+        g_plus = self.max_top_cut_on_dag(adj_list_transformed_dag)
+        
+        # max peak memory: (change this to use networkx)
+        max_peak_memory = self.max_weight_on_top_cut_dag(adj_list_transformed_dag, g_plus)
+        print(f"MAX  PEAK MEMORY IS: {max_peak_memory}")
+
+        #TODO: Transformation to maintain SP property of graphs? (Fusion of nodes)
+        
+        #TODO:  ILP to scheduling such a graph within a bounded memory M(we can set this to less than
+        # the peak memoru of eager so that ratio is > 1.0) << max_peak_memory
+        
+        
+        
+        
 
         # for snode in self.nodes:
         #     name_ = snode.get_name()
@@ -1338,7 +1356,7 @@ class Scheduler:
         self.logged_slow_fusion = set()
         self.fuse_nodes()
 
-        #TODO: check if nodes HAVE Multiple outputs and their representation
+       
         if config.reorder_for_compute_comm_overlap:
             # Refresh node_users and inverse_users to reflect fused nodes
             self.compute_node_users()
@@ -1373,22 +1391,14 @@ class Scheduler:
         ""
         DAG G = (V, E). Its nodes i ∈ V represent tasks and its
         edges e ∈ E represent precedence relations, in the form of input
-        and output data. The processing time necessary to complete a task
-        i ∈ V is denoted by w_i. In our model, the memory usage of the
-        computation is modeled only by the size of the data produced by
-        the tasks and represented by the edges. Therefore, for each edge
-        e = (i, j), we denote by m_e or m_{i,j} the size of the data produced by
-        task i for task j. We assume that G contains a single source node s
-        and a single sink node t; otherwise, one can add such nodes along
-        with the appropriate edges, all of null weight. An example of such
-        a graph is illustrated in Fig. 1.
+        and output data.
         ""
         Args:
             self: The Scheduler object.
 
         Returns:
-            adj_list: A dictionary representing the weighted adjacency list of the DAG.Denotes which is the source node 
-            and which is the sink node. For each edge we also store size of data produced by node i for node j
+            adj_list: A dictionary representing the weighted adjacency list of the DAG.Adds dummy source node to DAG.
+            For each edge we also store size of data produced by node i for node j
 
             Example entry
 
@@ -1421,6 +1431,10 @@ class Scheduler:
                 return True
 
         adj_list = {}
+
+        # initialize input sink node
+        adj_list['INPUT'] = {'shared_data': False, 'is_source': True, 'is_sink': False, 'users': []}
+
         for node in self.nodes:
             node_name = node.get_name()
             adj_list[node_name] = {
@@ -1430,14 +1444,11 @@ class Scheduler:
                 'users': []  # List of dependent nodes and data sizes
             }
 
-            # DEBUG
-            # print("node name is: ", node_name)
-            # print("node reads are: \n", node.read_writes.reads)
-            # print("node writes are: \n", node.read_writes.writes)
-            # print("node size is: \n", node.get_read_write_buffers_sizes())
-            # print("node layout is: \n", node.node.get_layout())
-            # print("node runtime is: \n", node.get_estimated_runtime())
-            # print("node comp buffer writes are: \n", node.node.get_read_writes().writes)
+            # if node is source connect dummy source with 0 weight and change status to no longer source node
+            if adj_list[node_name]['is_source']:
+                adj_list['INPUT']['users'].append((node_name, 0))
+                adj_list[node_name]['is_source'] = False
+
             for dependent_node in node.users:
                 dependent_name = dependent_node.get_name()
 
@@ -1445,10 +1456,65 @@ class Scheduler:
                 data_size = get_data_size(node)  
                 adj_list[node_name]['users'].append((dependent_name, data_size))
 
+       
         # add output sink node
         adj_list['OUTPUT'] = {'shared_data': False, 'is_source': False, 'is_sink': True, 'users': []}
 
         return adj_list
+    
+    def create_transform_adj_list_split_nodes(self, adj_list):
+        """
+        Transforms the given adjacency list representation by splitting each node
+        into two nodes (i1 and i2) and applying the specified transformation rules.
+
+        Args:
+            adj_list: A dictionary representing the adjacency list.
+
+        Returns:
+            A new dictionary representing the transformed adjacency list.
+        """
+
+        new_adj_list = {}
+
+        # Process each node
+        for node_name, node_data in adj_list.items():
+            for dependent_name, data_size in node_data["users"]:
+                # Do not split the sink
+                if dependent_name not in ("OUTPUT"):
+                    i1_name = f"{dependent_name}_1"
+                    i2_name = f"{dependent_name}_2"
+
+                    # Create new nodes (i1 and i2) with updated user lists
+                    output_data = 0
+                    if adj_list[dependent_name]['shared_data']: 
+                        output_data = adj_list[dependent_name]['users'][0][1]
+                    else:
+                        for _, out_data in adj_list[dependent_name]['users']:
+                            output_data += out_data
+                    
+                    # Add split nodes to graph
+                    if (i1_name in new_adj_list.keys()):
+                        new_adj_list[i1_name] = {'shared_data': False, 'is_source': False, 'is_sink': False, "users": [(i2_name, data_size + new_adj_list[i1_name]['users'][0][1])]}
+                        new_adj_list[i2_name] = {'shared_data': adj_list[dependent_name]['shared_data'], 'is_source': False, 'is_sink': False, "users": []}
+                    else:
+                        new_adj_list[i1_name] = {'shared_data': False, 'is_source': False, 'is_sink': False, "users": [(i2_name, data_size + output_data)]}
+                        new_adj_list[i2_name] = {'shared_data': adj_list[dependent_name]['shared_data'], 'is_source': False, 'is_sink': False, "users": []}
+
+                    # Connect to output
+                    for out_name, out_data in adj_list[dependent_name]['users']:
+                        if out_name not in ("OUTPUT"):
+                            out_name = f"{out_name}_1"
+
+                        new_adj_list[i2_name]["users"].append((out_name, out_data))
+                
+        # Handle special nodes (INPUT and OUTPUT)
+        new_adj_list["INPUT"] = {'shared_data': False, 'is_source': True, 'is_sink': False, "users": []}
+        for user_, data_ in adj_list["INPUT"]['users']:
+            new_adj_list["INPUT"]["users"].append((f"{user_}_1", data_))
+
+        new_adj_list["OUTPUT"] = adj_list["OUTPUT"].copy()
+
+        return new_adj_list
 
   
     def create_simple_data_flow_model_graph(self, adj_list_dag):
@@ -1472,8 +1538,6 @@ class Scheduler:
         has been used by all the successors sharing it
         ""
         """
-        print("in graph transform")
-
         import copy
 
         # simple_data_flow_graph = {}
@@ -1493,58 +1557,274 @@ class Scheduler:
                 for user in adj_list_dag[task]['users']:
                     simple_data_flow_graph[task]['users'].append((user[0], 0))
                     print("user 0 is: ", user[0])
-                    simple_data_flow_graph[user[0]]['users'].append((dealloc_task, 0))
+
+                    if user[0] in simple_data_flow_graph:
+                        simple_data_flow_graph[user[0]]['users'].append((dealloc_task, 0))
+                    else:
+                        simple_data_flow_graph[user[0]] = {'shared_data': False, 'is_source': False, 'is_sink': True, 'users': [(dealloc_task, 0)]}
 
                 # add edge of size shared_data_size to dealloc_task from task
                 simple_data_flow_graph[task]['users'].append((dealloc_task, shared_data_size))
 
-                # set shared data to false
-                simple_data_flow_graph[task]['shared_data'] = False
+                # TODO: CHECK if we need to set shared data to false for any downstream work
+                #simple_data_flow_graph[task]['shared_data'] = False
 
-                # add dealloc task to graph
-                simple_data_flow_graph[dealloc_task] = {'shared_data': False, 'is_source': False, 'is_sink': True, 'users': []}
+                # add dealloc task to graph with null weight edge to output(need 2 terminal graph)
+                simple_data_flow_graph[dealloc_task] = {'shared_data': False, 'is_source': False, 'is_sink': True, 'users': [('OUTPUT', 0)]}
+                
 
         return simple_data_flow_graph
     
 
-    def calculate_fmax_adj_list(self, adj_list):
+    def make_simple_data_flow_model_graph_sp_compatible(self, simple_data_graph):
+        pass
+
+    def max_top_cut_on_dag(self, adj_list_graph):
         """
-        Calculates the total size of data transferred across all edges in the DAG.
-
-        Args:
-            adj_list: A dictionary representing the adjacency list of the DAG.
-
-        Returns:
-            The total data size + 1 = f_max.
+        1 Construct a flow f for which ∀(i, j) ∈ E, fi,j ≥ fmax, where
+        fmax = 1 +Σ(i,j)∈E mi,j
+        2 Define the graph G+ equal to G except that m+i,j = fi,j - mi,j
+        3 Compute an optimal solution f+ to the MaxFlow problem on
+        G+
+        4 S ←set of vertices reachable from s in the residual network
+        induced by f + ; T ←V \ S
+        5 return the cut (S, T )
         """
-        total_size = 0
-        for node, info in adj_list.items():
-            for dependent, data_size in info['users']:
-                total_size += data_size
-        return 1 + total_size
 
-    
-    def topological_sort(self, adj_list_graph):
+        from collections import defaultdict
 
-        """
-        Create topogical sort based of adj_list_graph representation
-        """
-        visited = set()
-        stack = []
+        def calculate_fmax_adj_list(adj_list):
+            """
+            Calculates the total size of data transferred across all edges in the DAG.
 
-        def dfs(node):
-            visited.add(node)
-            for neighbour in adj_list_graph[node]['users']:
-                if neighbour[0] not in visited:
-                    dfs(neighbour[0])
-            stack.insert(0, node)
+            Args:
+                adj_list: A dictionary representing the adjacency list of the DAG.
 
-        for node in adj_list_graph:
-            if node not in visited:
-                dfs(node)
+            Returns:
+                The total data size + 1 = f_max.
+            """
+            total_size = 0
+            for node, info in adj_list.items():
+                for dependent, data_size in info['users']:
+                    total_size += data_size
+            return 1 + total_size
+        
+        def topological_sort(adj_list_graph):
 
-        return stack
+            """
+            Create topogical sort based of adj_list_graph representation
+            """
+            visited = set()
+            stack = []
 
+            def dfs(node):
+                visited.add(node)
+                for neighbour in adj_list_graph[node]['users']:
+                    if neighbour[0] not in visited:
+                        dfs(neighbour[0])
+                stack.insert(0, node)
+
+            for node in adj_list_graph:
+                if node not in visited:
+                    dfs(node)
+
+            return stack
+        
+        def build_initial_flow(adj_list, fmax):
+            """
+            Constructs a flow dictionary with a value of at least fmax on all edges.
+
+            Args:
+                adj_list: A dictionary representing the adjacency list of the DAG.
+                - Key: Node name
+                - Value: Dictionary with node information
+                    - 'shared_data': (Optional) Flag indicating shared data
+                    - 'is_source': Flag indicating source node
+                    - 'is_sink': Flag indicating sink node
+                    - 'users': List of tuples (dependent_node, data_size)
+                fmax: The minimum edge capacity.
+
+            Returns:
+                A dictionary representing the initial flow.
+                - Key: Node name (source)
+                - Value: Dictionary with destination nodes and their flow values
+                    (all at least fmax).
+            """
+
+            flow = defaultdict(lambda: defaultdict(int))
+            topological_sort_nodes = topological_sort(adj_list_graph)
+
+            # Loop in topological order would be more efficient)
+            for node_name in topological_sort_nodes:
+                for dependent, _ in adj_list[node_name]['users']:
+                    # Set flow value to fmax
+                    flow[node_name][dependent] = fmax
+
+            
+            # add output node
+            flow["OUTPUT"] = defaultdict(int)
+          
+            return flow
+        
+        def create_graph_plus(adj_list, flow):
+            """
+            Constructs the graph G+ from the original graph and initial flow.
+
+            Args:
+                adj_list: A dictionary representing the adjacency list of the DAG.
+                - Key: Node name
+                - Value: Dictionary with node information
+                    - 'shared_data': (Optional) Flag indicating shared data
+                    - 'is_source': Flag indicating source node
+                    - 'is_sink': Flag indicating sink node
+                    - 'users': List of tuples (dependent_node, data_size)
+                flow: A dictionary representing the initial flow.
+                - Key: Node name (source)
+                - Value: Dictionary with destination nodes and their flow values.
+
+            Returns:
+                A dictionary representing the graph G+.
+                - Key: Node name
+                - Value: Dictionary with destination nodes and their capacities in G+.
+            """
+
+            g_plus = defaultdict(lambda: defaultdict(int))
+            for node, info in adj_list.items():
+                for dependent, data_size in info['users']:
+                    # m+_ij = f_ij - m_ij (data size from adj_list)
+                    capacity = flow[node][dependent] - data_size
+                    g_plus[node][dependent] = capacity
+
+            # add output node
+            g_plus["OUTPUT"] = defaultdict(int)
+            
+            return g_plus
+
+        f_max = calculate_fmax_adj_list(adj_list_graph)
+        print("f max is: \n", f_max)
+        flow_f = build_initial_flow(adj_list_graph, f_max)
+        print("flow f is: \n", flow_f)
+        graph_g_plus = create_graph_plus(adj_list_graph, flow_f)
+        print("graph_g_plus is: \n", graph_g_plus)
+        
+        return graph_g_plus
+        
+    def max_weight_on_top_cut_dag(self, g, g_plus):
+        
+        from collections import defaultdict, deque
+
+        def ford_fulkerson(graph, source, sink):
+            def bfs(graph, source, sink, parent):
+                visited = set()
+                queue = deque()
+                queue.append(source)
+                visited.add(source)
+                while queue:
+                    u = queue.popleft()
+                    for v, capacity_info in graph[u].items():
+                        if v not in visited and capacity_info['capacity'] > capacity_info['flow']:
+                            queue.append(v)
+                            visited.add(v)
+                            parent[v] = u
+                            if v == sink:
+                                return True
+                return False
+
+            parent = defaultdict(lambda: None)
+            max_flow = 0
+
+            while bfs(graph, source, sink, parent):
+                path_flow = float('inf')
+                s = sink
+                while s != source:
+                    path_flow = min(path_flow, graph[parent[s]][s]['capacity'] - graph[parent[s]][s]['flow'])
+                    s = parent[s]
+
+                max_flow += path_flow
+
+                v = sink
+                while v != source:
+                    u = parent[v]
+                    graph[u][v]['flow'] += path_flow
+                    graph[v][u]['flow'] -= path_flow  # Update reverse edge
+                    v = parent[v]
+
+            return graph, max_flow
+
+        def find_cut(graph_g_plus, source, flow_dict):
+            S = set()  # Set of nodes reachable from source
+            T = set(graph_g_plus.keys())  # Initialize with all nodes (adjust if no graph_g_plus)
+
+            # Explore reachable nodes from source using flow information
+            for source in flow_dict:  # Iterate through source node directly
+                for neighbor in graph_g_plus[source]:  # Use adjacency information from graph_g_plus
+                    flow_value = flow_dict[source].get(neighbor, 0)  # Get flow value for neighbor (default 0)
+
+                    if flow_value['flow'] < graph_g_plus[source][neighbor] if graph_g_plus else flow_value['flow'] > 0:  # Check residual capacity or positive flow
+
+                        S.add(neighbor)
+                        if neighbor in T:
+                            T.remove(neighbor)
+
+            return S, T
+        
+        def cut_weight(graph, S, T):
+            """
+            Calculates the weight of a cut in a weighted DAG.
+
+            Args:
+                graph: A dictionary representing the adjacency list of the DAG.
+                    - Key: Node name
+                    - Value: Dictionary with destination nodes and their weights
+                S: A set of nodes on one side of the cut.
+                T: A set of nodes on the other side of the cut.
+
+            Returns:
+                The weight of the cut (sum of weights on edges crossing the cut).
+            """
+
+            weight = 0
+
+            # For each node in S
+            for node in S:
+                # For each edge from this node
+
+                for user in graph[node]['users']:
+                    dest = user[0]
+                    edge_weight = user[1]
+                    
+                    # If the destination node is in T, add the weight of the edge to the total
+                    if dest in T:
+                        weight += edge_weight
+
+            return weight
+        
+        source = 'INPUT'
+        sink = 'OUTPUT'
+
+        # Create a deep copy of the graph to avoid modifying the original graph
+        residual_graph = defaultdict(lambda: defaultdict(dict))
+        for u, edges in g_plus.items():
+            for v, capacity in edges.items():
+                residual_graph[u][v]['capacity'] = capacity
+                residual_graph[u][v]['flow'] = 0  # Initialize flow to 0
+                # Add reverse edge in the residual graph
+                if u not in residual_graph[v]:
+                    residual_graph[v][u] = {'capacity': 0, 'flow': 0}
+
+
+        # Compute the maximum flow and get the residual network
+        residual_graph, max_flow = ford_fulkerson(residual_graph, source, sink)
+
+        # Find the cut (S, T)
+        S, T = find_cut(g_plus, source, residual_graph)
+        
+        # find weight of cut on original graph
+        max_peak_memory = cut_weight(g, S, T)
+        
+        return max_peak_memory
+        
+        
 
     def debug_draw_graph(self):
         """Generate an image of the graph for debugging"""
